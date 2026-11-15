@@ -20,39 +20,79 @@ class AiClient(private val store: SecureStore) {
     suspend fun ask(convo: List<Pair<String, String>>, memory: String): Reply = withContext(Dispatchers.IO) {
         val key = store.apiKey
         require(key.isNotBlank()) { "API key missing. Add it in Settings." }
+        val out = if (key.startsWith("sk-ant")) callClaude(key, convo, memory) else callGemini(key, convo, memory)
+        parse(out)
+    }
 
-        val msgs = JSONArray()
-        convo.forEach { (role, content) -> msgs.put(JSONObject().put("role", role).put("content", content)) }
-        val body = JSONObject()
-            .put("model", store.model)
-            .put("max_tokens", 700)
-            .put("system", systemPrompt(memory))
-            .put("messages", msgs)
-
-        val conn = (URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection).apply {
+    private fun post(url: String, headers: Map<String, String>, body: JSONObject): Pair<Int, String> {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 15000
-            readTimeout = 45000
+            readTimeout = 60000
             doOutput = true
             setRequestProperty("content-type", "application/json")
-            setRequestProperty("x-api-key", key)
-            setRequestProperty("anthropic-version", "2023-06-01")
+            headers.forEach { (k, v) -> setRequestProperty(k, v) }
         }
         conn.outputStream.use { it.write(body.toString().toByteArray()) }
         val code = conn.responseCode
         val text = (if (code in 200..299) conn.inputStream else conn.errorStream)
             ?.bufferedReader()?.use { it.readText() }.orEmpty()
+        return code to text
+    }
+
+    private fun callClaude(key: String, convo: List<Pair<String, String>>, memory: String): String {
+        val model = store.model.takeIf { it.startsWith("claude") } ?: "claude-sonnet-5-5"
+        val msgs = JSONArray()
+        convo.forEach { (role, content) -> msgs.put(JSONObject().put("role", role).put("content", content)) }
+        val body = JSONObject()
+            .put("model", model)
+            .put("max_tokens", 700)
+            .put("system", systemPrompt(memory))
+            .put("messages", msgs)
+        val (code, text) = post(
+            "https://api.anthropic.com/v1/messages",
+            mapOf("x-api-key" to key, "anthropic-version" to "2023-06-01"), body
+        )
         if (code == 401) error("API key rejected (401)")
         if (code !in 200..299) error("AI service error $code")
-
         val blocks = JSONObject(text).getJSONArray("content")
-        val out = buildString {
+        return buildString {
             for (i in 0 until blocks.length()) {
                 val b = blocks.getJSONObject(i)
                 if (b.optString("type") == "text") append(b.getString("text"))
             }
         }
-        parse(out)
+    }
+
+    private fun callGemini(key: String, convo: List<Pair<String, String>>, memory: String): String {
+        val model = store.model.takeIf { it.startsWith("gemini") } ?: "gemini-3.8-flash"
+        val contents = JSONArray()
+        convo.forEach { (role, content) ->
+            contents.put(
+                JSONObject()
+                    .put("role", if (role == "assistant") "model" else "user")
+                    .put("parts", JSONArray().put(JSONObject().put("text", content)))
+            )
+        }
+        val body = JSONObject()
+            .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPrompt(memory)))))
+            .put("contents", contents)
+            .put("generationConfig", JSONObject().put("maxOutputTokens", 2048).put("responseMimeType", "application/json"))
+        val (code, text) = post(
+            "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent",
+            mapOf("x-goog-api-key" to key), body
+        )
+        when (code) {
+            400, 403 -> error("Gemini key rejected or request invalid ($code)")
+            404 -> error("Gemini model '$model' not found. Set a valid model name in Settings.")
+            429 -> error("Gemini free limit reached. Try again in a minute.")
+        }
+        if (code !in 200..299) error("AI service error $code")
+        val parts = JSONObject(text).getJSONArray("candidates").getJSONObject(0)
+            .getJSONObject("content").getJSONArray("parts")
+        return buildString {
+            for (i in 0 until parts.length()) append(parts.getJSONObject(i).optString("text"))
+        }
     }
 
     private fun parse(out: String): Reply {
